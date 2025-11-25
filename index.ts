@@ -17,9 +17,11 @@ import {
   ImageContent,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import playwright, { Browser, Page } from "playwright";
+import playwright, { Browser, Page, BrowserContext, chromium, firefox, webkit } from "playwright";
 
 enum ToolName {
+  BrowserLaunch = "browser_launch",
+  BrowserClose = "browser_close",
   BrowserNavigate = "browser_navigate",
   BrowserScreenshot = "browser_screenshot",
   BrowserClick = "browser_click",
@@ -34,6 +36,54 @@ enum ToolName {
 
 // Define the tools once to avoid repetition
 const TOOLS: Tool[] = [
+  {
+    name: ToolName.BrowserLaunch,
+    description: "Launch a new browser or connect to existing via CDP. Auto-closes any existing browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        browserType: {
+          type: "string",
+          enum: ["chromium", "firefox", "webkit"],
+          description: "Browser to launch (default: chromium)"
+        },
+        headless: {
+          type: "boolean",
+          description: "Run in headless mode (default: false)"
+        },
+        cdpEndpoint: {
+          type: "string",
+          description: "CDP endpoint URL for existing browser (chromium only, e.g., http://localhost:9222)"
+        },
+        viewport: {
+          type: "object",
+          properties: {
+            width: { type: "number" },
+            height: { type: "number" }
+          },
+          description: "Viewport size"
+        },
+        windowPosition: {
+          type: "object",
+          properties: {
+            x: { type: "number" },
+            y: { type: "number" }
+          },
+          description: "Window position on screen (non-headless only)"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserClose,
+    description: "Close the current browser instance",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
   {
     name: ToolName.BrowserNavigate,
     description: "Navigate to a URL",
@@ -153,36 +203,134 @@ const TOOLS: Tool[] = [
 
 // Global state
 let browser: Browser | undefined;
+let context: BrowserContext | undefined;
 let page: Page | undefined;
 const consoleLogs: string[] = [];
 const screenshots = new Map<string, string>();
 
+async function closeBrowser() {
+  if (page) {
+    try { await page.close(); } catch {}
+    page = undefined;
+  }
+  if (context) {
+    try { await context.close(); } catch {}
+    context = undefined;
+  }
+  if (browser) {
+    try { await browser.close(); } catch {}
+    browser = undefined;
+  }
+}
+
 async function ensureBrowser() {
   if (!browser) {
-    browser = await playwright.firefox.launch({ headless: false });
+    browser = await playwright.chromium.launch({ headless: false });
+    context = await browser.newContext();
   }
 
   if (!page) {
-    page = await browser.newPage();
+    page = await context!.newPage();
+    page.on("console", (msg) => {
+      const logEntry = `[${msg.type()}] ${msg.text()}`;
+      consoleLogs.push(logEntry);
+      server.notification({
+        method: "notifications/resources/updated",
+        params: { uri: "console://logs" },
+      });
+    });
   }
 
-  page.on("console", (msg) => {
-    const logEntry = `[${msg.type()}] ${msg.text()}`;
-    consoleLogs.push(logEntry);
-    server.notification({
-      method: "notifications/resources/updated",
-      params: { uri: "console://logs" },
-    });
-  });
   return page!;
 }
 
 async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult> {
-  const page = await ensureBrowser();
+  // Handle browser lifecycle tools first (don't need ensureBrowser)
+  switch (name) {
+    case ToolName.BrowserLaunch: {
+      await closeBrowser();
+
+      const browserType = args.browserType || "chromium";
+      const headless = args.headless ?? false;
+      const cdpEndpoint = args.cdpEndpoint;
+
+      // Validate CDP only works with chromium
+      if (cdpEndpoint && browserType !== "chromium") {
+        return {
+          content: [{ type: "text", text: "CDP connection only works with chromium" }],
+          isError: true
+        };
+      }
+
+      try {
+        if (cdpEndpoint) {
+          browser = await chromium.connectOverCDP(cdpEndpoint);
+          const contexts = browser.contexts();
+          context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+        } else {
+          const launchOptions: any = { headless };
+
+          if (args.windowPosition && !headless) {
+            launchOptions.args = [`--window-position=${args.windowPosition.x},${args.windowPosition.y}`];
+          }
+
+          browser = await playwright[browserType as "chromium" | "firefox" | "webkit"].launch(launchOptions);
+
+          const contextOptions: any = {};
+          if (args.viewport) {
+            contextOptions.viewport = args.viewport;
+          }
+          context = await browser.newContext(contextOptions);
+        }
+
+        page = await context.newPage();
+        page.on("console", (msg) => {
+          const logEntry = `[${msg.type()}] ${msg.text()}`;
+          consoleLogs.push(logEntry);
+          server.notification({
+            method: "notifications/resources/updated",
+            params: { uri: "console://logs" }
+          });
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: cdpEndpoint
+              ? `Connected to browser via CDP at ${cdpEndpoint}`
+              : `Launched ${browserType} (headless: ${headless})`
+          }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to launch browser: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserClose: {
+      if (!browser) {
+        return {
+          content: [{ type: "text", text: "No browser is currently open" }],
+          isError: false
+        };
+      }
+      await closeBrowser();
+      return {
+        content: [{ type: "text", text: "Browser closed" }],
+        isError: false
+      };
+    }
+  }
+
+  // For all other tools, ensure browser exists
+  await ensureBrowser();
 
   switch (name) {
     case ToolName.BrowserNavigate:
-      await page.goto(args.url);
+      await page!.goto(args.url);
       return {
         content: [{
           type: "text",
@@ -195,8 +343,8 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
       const fullPage = (args.fullPage === 'true');
 
       const screenshot = await (args.selector ?
-        page.locator(args.selector).screenshot() :
-        page.screenshot({ fullPage }));
+        page!.locator(args.selector).screenshot() :
+        page!.screenshot({ fullPage }));
       const base64Screenshot = screenshot.toString('base64');
 
       if (!base64Screenshot) {
@@ -232,7 +380,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserClick:
       try {
-        await page.locator(args.selector).click();
+        await page!.locator(args.selector).click();
         return {
           content: [{
             type: "text",
@@ -244,7 +392,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.locator(args.selector).first().click();
+                await page!.locator(args.selector).first().click();
                 return {
                     content: [{
                         type: "text",
@@ -274,7 +422,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserClickText:
       try {
-        await page.getByText(args.text).click();
+        await page!.getByText(args.text).click();
         return {
           content: [{
             type: "text",
@@ -286,7 +434,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.getByText(args.text).first().click();
+                await page!.getByText(args.text).first().click();
                 return {
                     content: [{
                         type: "text",
@@ -315,7 +463,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserFill:
       try {
-        await page.locator(args.selector).pressSequentially(args.value, { delay: 100 });
+        await page!.locator(args.selector).pressSequentially(args.value, { delay: 100 });
         return {
           content: [{
             type: "text",
@@ -327,7 +475,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.locator(args.selector).first().pressSequentially(args.value, { delay: 100 });
+                await page!.locator(args.selector).first().pressSequentially(args.value, { delay: 100 });
                 return {
                     content: [{
                         type: "text",
@@ -356,7 +504,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserSelect:
       try {
-        await page.locator(args.selector).selectOption(args.value);
+        await page!.locator(args.selector).selectOption(args.value);
         return {
           content: [{
             type: "text",
@@ -368,7 +516,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.locator(args.selector).first().selectOption(args.value);
+                await page!.locator(args.selector).first().selectOption(args.value);
                 return {
                     content: [{
                         type: "text",
@@ -397,7 +545,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserSelectText:
       try {
-        await page.getByText(args.text).selectOption(args.value);
+        await page!.getByText(args.text).selectOption(args.value);
         return {
           content: [{
             type: "text",
@@ -409,7 +557,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.getByText(args.text).first().selectOption(args.value);
+                await page!.getByText(args.text).first().selectOption(args.value);
                 return {
                     content: [{
                         type: "text",
@@ -438,7 +586,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserHover:
       try {
-        await page.locator(args.selector).hover();
+        await page!.locator(args.selector).hover();
         return {
           content: [{
             type: "text",
@@ -450,7 +598,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.locator(args.selector).first().hover();
+                await page!.locator(args.selector).first().hover();
                 return {
                     content: [{
                         type: "text",
@@ -479,7 +627,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserHoverText:
       try {
-        await page.getByText(args.text).hover();
+        await page!.getByText(args.text).hover();
         return {
           content: [{
             type: "text",
@@ -491,7 +639,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page.getByText(args.text).first().hover();
+                await page!.getByText(args.text).first().hover();
                 return {
                     content: [{
                         type: "text",
@@ -520,7 +668,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserEvaluate:
       try {
-        const result = await page.evaluate((script) => {
+        const result = await page!.evaluate((script) => {
           const logs: string[] = [];
           const originalConsole = { ...console };
 
