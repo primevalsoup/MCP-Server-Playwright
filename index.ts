@@ -19,6 +19,30 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import playwright, { Browser, Page, BrowserContext, chromium, firefox, webkit } from "playwright";
 
+// Log entry interfaces
+interface NetworkLogEntry {
+  id: string;
+  timestamp: number;
+  type: 'request' | 'response' | 'requestfailed';
+  url: string;
+  method: string;
+  resourceType: string;
+  status?: number;
+  statusText?: string;
+  duration?: number;
+  errorText?: string;
+}
+
+interface ConsoleLogEntry {
+  timestamp: number;
+  type: string;
+  text: string;
+}
+
+// Buffer limits
+const MAX_NETWORK_LOGS = 1000;
+const MAX_CONSOLE_LOGS = 500;
+
 enum ToolName {
   BrowserLaunch = "browser_launch",
   BrowserClose = "browser_close",
@@ -31,7 +55,8 @@ enum ToolName {
   BrowserSelectText = "browser_select_text",
   BrowserHover = "browser_hover",
   BrowserHoverText = "browser_hover_text",
-  BrowserEvaluate = "browser_evaluate"
+  BrowserEvaluate = "browser_evaluate",
+  BrowserGetLogs = "browser_get_logs"
 }
 
 // Define the tools once to avoid repetition
@@ -54,6 +79,10 @@ const TOOLS: Tool[] = [
         cdpEndpoint: {
           type: "string",
           description: "CDP endpoint URL for existing browser (chromium only, e.g., http://localhost:9222)"
+        },
+        debugPort: {
+          type: "number",
+          description: "Remote debugging port for launched browser (chromium only, not applicable when using cdpEndpoint)"
         },
         viewport: {
           type: "object",
@@ -199,14 +228,182 @@ const TOOLS: Tool[] = [
       required: ["script"],
     },
   },
+  {
+    name: ToolName.BrowserGetLogs,
+    description: "Retrieve browser console and/or network logs collected during the session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        logTypes: {
+          type: "array",
+          items: { type: "string", enum: ["console", "network"] },
+          description: "Types of logs to retrieve (default: both)"
+        },
+        clear: {
+          type: "boolean",
+          description: "Clear logs after retrieval (default: false)"
+        },
+        filter: {
+          type: "object",
+          properties: {
+            console: {
+              type: "object",
+              properties: {
+                types: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by console types: log, warn, error, info, debug"
+                },
+                search: {
+                  type: "string",
+                  description: "Filter by text content (case-insensitive substring match)"
+                }
+              }
+            },
+            network: {
+              type: "object",
+              properties: {
+                methods: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by HTTP methods: GET, POST, PUT, DELETE, etc."
+                },
+                statusCodes: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Filter by specific status codes"
+                },
+                statusRange: {
+                  type: "object",
+                  properties: {
+                    min: { type: "number" },
+                    max: { type: "number" }
+                  },
+                  description: "Filter by status code range (e.g., {min: 400, max: 599} for errors)"
+                },
+                urlPattern: {
+                  type: "string",
+                  description: "Filter by URL pattern (regex)"
+                },
+                resourceTypes: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by resource types: xhr, fetch, document, script, stylesheet, image"
+                },
+                failedOnly: {
+                  type: "boolean",
+                  description: "Show only failed requests"
+                }
+              }
+            }
+          },
+          description: "Filters to apply to logs"
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of entries to return per log type (default: 100)"
+        }
+      },
+      required: []
+    }
+  },
 ];
 
 // Global state
 let browser: Browser | undefined;
 let context: BrowserContext | undefined;
 let page: Page | undefined;
-const consoleLogs: string[] = [];
+const consoleLogs: ConsoleLogEntry[] = [];
+const networkLogs: NetworkLogEntry[] = [];
+const pendingRequests = new Map<string, { startTime: number; id: string }>();
 const screenshots = new Map<string, string>();
+
+// Helper function to attach page event listeners for logging
+function attachPageListeners(targetPage: Page) {
+  // Console listener
+  targetPage.on("console", (msg) => {
+    if (consoleLogs.length >= MAX_CONSOLE_LOGS) {
+      consoleLogs.shift();
+    }
+    const entry: ConsoleLogEntry = {
+      timestamp: Date.now(),
+      type: msg.type(),
+      text: msg.text()
+    };
+    consoleLogs.push(entry);
+    server.notification({
+      method: "notifications/resources/updated",
+      params: { uri: "console://logs" },
+    });
+  });
+
+  // Request listener - capture outgoing requests
+  targetPage.on("request", (request) => {
+    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const key = request.url() + request.method();
+    pendingRequests.set(key, { startTime: Date.now(), id });
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id,
+      timestamp: Date.now(),
+      type: 'request',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType()
+    };
+    networkLogs.push(entry);
+  });
+
+  // Response listener - capture responses
+  targetPage.on("response", (response) => {
+    const request = response.request();
+    const key = request.url() + request.method();
+    const pending = pendingRequests.get(key);
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id: pending?.id || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: Date.now(),
+      type: 'response',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      status: response.status(),
+      statusText: response.statusText(),
+      duration: pending ? Date.now() - pending.startTime : undefined
+    };
+    networkLogs.push(entry);
+    pendingRequests.delete(key);
+  });
+
+  // Request failed listener
+  targetPage.on("requestfailed", (request) => {
+    const key = request.url() + request.method();
+    const pending = pendingRequests.get(key);
+    const failure = request.failure();
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id: pending?.id || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: Date.now(),
+      type: 'requestfailed',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      errorText: failure?.errorText || 'Unknown error',
+      duration: pending ? Date.now() - pending.startTime : undefined
+    };
+    networkLogs.push(entry);
+    pendingRequests.delete(key);
+  });
+}
 
 async function closeBrowser() {
   if (page) {
@@ -221,6 +418,10 @@ async function closeBrowser() {
     try { await browser.close(); } catch {}
     browser = undefined;
   }
+  // Clear logs on browser close
+  consoleLogs.length = 0;
+  networkLogs.length = 0;
+  pendingRequests.clear();
 }
 
 async function ensureBrowser() {
@@ -231,14 +432,7 @@ async function ensureBrowser() {
 
   if (!page) {
     page = await context!.newPage();
-    page.on("console", (msg) => {
-      const logEntry = `[${msg.type()}] ${msg.text()}`;
-      consoleLogs.push(logEntry);
-      server.notification({
-        method: "notifications/resources/updated",
-        params: { uri: "console://logs" },
-      });
-    });
+    attachPageListeners(page);
   }
 
   return page!;
@@ -253,11 +447,28 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
       const browserType = args.browserType || "chromium";
       const headless = args.headless ?? false;
       const cdpEndpoint = args.cdpEndpoint;
+      const debugPort = args.debugPort;
 
       // Validate CDP only works with chromium
       if (cdpEndpoint && browserType !== "chromium") {
         return {
           content: [{ type: "text", text: "CDP connection only works with chromium" }],
+          isError: true
+        };
+      }
+
+      // Validate debugPort cannot be used with cdpEndpoint
+      if (debugPort && cdpEndpoint) {
+        return {
+          content: [{ type: "text", text: "debugPort cannot be used with cdpEndpoint (connecting to existing browser)" }],
+          isError: true
+        };
+      }
+
+      // Validate debugPort only works with chromium
+      if (debugPort && browserType !== "chromium") {
+        return {
+          content: [{ type: "text", text: "debugPort only works with chromium browser type" }],
           isError: true
         };
       }
@@ -269,9 +480,19 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
           context = contexts.length > 0 ? contexts[0] : await browser.newContext();
         } else {
           const launchOptions: any = { headless };
+          const launchArgs: string[] = [];
 
           if (args.windowPosition && !headless) {
-            launchOptions.args = [`--window-position=${args.windowPosition.x},${args.windowPosition.y}`];
+            launchArgs.push(`--window-position=${args.windowPosition.x},${args.windowPosition.y}`);
+          }
+
+          // Add remote debugging port if specified
+          if (debugPort) {
+            launchArgs.push(`--remote-debugging-port=${debugPort}`);
+          }
+
+          if (launchArgs.length > 0) {
+            launchOptions.args = launchArgs;
           }
 
           browser = await playwright[browserType as "chromium" | "firefox" | "webkit"].launch(launchOptions);
@@ -284,22 +505,18 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         }
 
         page = await context.newPage();
-        page.on("console", (msg) => {
-          const logEntry = `[${msg.type()}] ${msg.text()}`;
-          consoleLogs.push(logEntry);
-          server.notification({
-            method: "notifications/resources/updated",
-            params: { uri: "console://logs" }
-          });
-        });
+        attachPageListeners(page);
+
+        let responseText = cdpEndpoint
+          ? `Connected to browser via CDP at ${cdpEndpoint}`
+          : `Launched ${browserType} (headless: ${headless})`;
+
+        if (debugPort) {
+          responseText += ` with remote debugging on port ${debugPort}`;
+        }
 
         return {
-          content: [{
-            type: "text",
-            text: cdpEndpoint
-              ? `Connected to browser via CDP at ${cdpEndpoint}`
-              : `Launched ${browserType} (headless: ${headless})`
-          }],
+          content: [{ type: "text", text: responseText }],
           isError: false
         };
       } catch (error) {
@@ -708,6 +925,98 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         };
       }
 
+    case ToolName.BrowserGetLogs: {
+      const logTypes: string[] = args.logTypes || ["console", "network"];
+      const clear = args.clear ?? false;
+      const filter = args.filter || {};
+      const limit = args.limit ?? 100;
+
+      const result: any = {};
+
+      // Process console logs
+      if (logTypes.includes("console")) {
+        let filtered = [...consoleLogs];
+
+        if (filter.console) {
+          if (filter.console.types && filter.console.types.length > 0) {
+            filtered = filtered.filter(log => filter.console.types.includes(log.type));
+          }
+          if (filter.console.search) {
+            const searchLower = filter.console.search.toLowerCase();
+            filtered = filtered.filter(log => log.text.toLowerCase().includes(searchLower));
+          }
+        }
+
+        // Apply limit (most recent first)
+        result.console = {
+          total: consoleLogs.length,
+          filtered: filtered.length,
+          entries: filtered.slice(-limit).reverse()
+        };
+      }
+
+      // Process network logs
+      if (logTypes.includes("network")) {
+        let filtered = [...networkLogs];
+
+        if (filter.network) {
+          if (filter.network.methods && filter.network.methods.length > 0) {
+            const methods = filter.network.methods.map((m: string) => m.toUpperCase());
+            filtered = filtered.filter(log => methods.includes(log.method));
+          }
+          if (filter.network.statusCodes && filter.network.statusCodes.length > 0) {
+            filtered = filtered.filter(log =>
+              log.status !== undefined && filter.network.statusCodes.includes(log.status)
+            );
+          }
+          if (filter.network.statusRange) {
+            const { min, max } = filter.network.statusRange;
+            filtered = filtered.filter(log =>
+              log.status !== undefined && log.status >= min && log.status <= max
+            );
+          }
+          if (filter.network.urlPattern) {
+            const regex = new RegExp(filter.network.urlPattern, 'i');
+            filtered = filtered.filter(log => regex.test(log.url));
+          }
+          if (filter.network.resourceTypes && filter.network.resourceTypes.length > 0) {
+            filtered = filtered.filter(log =>
+              filter.network.resourceTypes.includes(log.resourceType)
+            );
+          }
+          if (filter.network.failedOnly) {
+            filtered = filtered.filter(log => log.type === 'requestfailed');
+          }
+        }
+
+        // Apply limit (most recent first)
+        result.network = {
+          total: networkLogs.length,
+          filtered: filtered.length,
+          entries: filtered.slice(-limit).reverse()
+        };
+      }
+
+      // Clear logs if requested
+      if (clear) {
+        if (logTypes.includes("console")) {
+          consoleLogs.length = 0;
+        }
+        if (logTypes.includes("network")) {
+          networkLogs.length = 0;
+          pendingRequests.clear();
+        }
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(result, null, 2)
+        }],
+        isError: false
+      };
+    }
+
     default:
       return {
         content: [{
@@ -753,11 +1062,16 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri.toString();
 
   if (uri === "console://logs") {
+    // Format console logs for resource read
+    const formattedLogs = consoleLogs.map(log =>
+      `[${log.type}] ${log.text}`
+    ).join("\n");
+
     return {
       contents: [{
         uri,
         mimeType: "text/plain",
-        text: consoleLogs.join("\n"),
+        text: formattedLogs,
       }],
     };
   }
