@@ -17,9 +17,36 @@ import {
   ImageContent,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import playwright, { Browser, Page } from "playwright";
+import playwright, { Browser, Page, BrowserContext, chromium, firefox, webkit } from "playwright";
+import sharp from 'sharp';
+
+// Log entry interfaces
+interface NetworkLogEntry {
+  id: string;
+  timestamp: number;
+  type: 'request' | 'response' | 'requestfailed';
+  url: string;
+  method: string;
+  resourceType: string;
+  status?: number;
+  statusText?: string;
+  duration?: number;
+  errorText?: string;
+}
+
+interface ConsoleLogEntry {
+  timestamp: number;
+  type: string;
+  text: string;
+}
+
+// Buffer limits
+const MAX_NETWORK_LOGS = 1000;
+const MAX_CONSOLE_LOGS = 500;
 
 enum ToolName {
+  BrowserLaunch = "browser_launch",
+  BrowserClose = "browser_close",
   BrowserNavigate = "browser_navigate",
   BrowserScreenshot = "browser_screenshot",
   BrowserClick = "browser_click",
@@ -29,11 +56,68 @@ enum ToolName {
   BrowserSelectText = "browser_select_text",
   BrowserHover = "browser_hover",
   BrowserHoverText = "browser_hover_text",
-  BrowserEvaluate = "browser_evaluate"
+  BrowserEvaluate = "browser_evaluate",
+  BrowserGetLogs = "browser_get_logs",
+  BrowserNewTab = "browser_new_tab",
+  BrowserListTabs = "browser_list_tabs",
+  BrowserSwitchTab = "browser_switch_tab",
+  BrowserCloseTab = "browser_close_tab"
 }
 
 // Define the tools once to avoid repetition
 const TOOLS: Tool[] = [
+  {
+    name: ToolName.BrowserLaunch,
+    description: "Launch a new browser or connect to existing via CDP. Auto-closes any existing browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        browserType: {
+          type: "string",
+          enum: ["chromium", "firefox", "webkit"],
+          description: "Browser to launch (default: chromium)"
+        },
+        headless: {
+          type: "boolean",
+          description: "Run in headless mode (default: false)"
+        },
+        cdpEndpoint: {
+          type: "string",
+          description: "CDP endpoint URL for existing browser (chromium only, e.g., http://localhost:9222)"
+        },
+        debugPort: {
+          type: "number",
+          description: "Remote debugging port for launched browser (chromium only, not applicable when using cdpEndpoint)"
+        },
+        viewport: {
+          type: "object",
+          properties: {
+            width: { type: "number" },
+            height: { type: "number" }
+          },
+          description: "Viewport size"
+        },
+        windowPosition: {
+          type: "object",
+          properties: {
+            x: { type: "number" },
+            y: { type: "number" }
+          },
+          description: "Window position on screen (non-headless only)"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserClose,
+    description: "Close the current browser instance",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
   {
     name: ToolName.BrowserNavigate,
     description: "Navigate to a URL",
@@ -54,6 +138,7 @@ const TOOLS: Tool[] = [
         name: { type: "string", description: "Name for the screenshot" },
         selector: { type: "string", description: "CSS selector for element to screenshot" },
         fullPage: { type: "boolean", description: "Take a full page screenshot (default: false)", default: false },
+        grayscale: { type: "boolean", description: "Convert to grayscale to reduce size by ~76% (default: true)", default: true },
       },
       required: ["name"],
     },
@@ -149,35 +234,408 @@ const TOOLS: Tool[] = [
       required: ["script"],
     },
   },
+  {
+    name: ToolName.BrowserGetLogs,
+    description: "Retrieve browser console and/or network logs collected during the session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        logTypes: {
+          type: "array",
+          items: { type: "string", enum: ["console", "network"] },
+          description: "Types of logs to retrieve (default: both)"
+        },
+        clear: {
+          type: "boolean",
+          description: "Clear logs after retrieval (default: false)"
+        },
+        filter: {
+          type: "object",
+          properties: {
+            console: {
+              type: "object",
+              properties: {
+                types: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by console types: log, warn, error, info, debug"
+                },
+                search: {
+                  type: "string",
+                  description: "Filter by text content (case-insensitive substring match)"
+                }
+              }
+            },
+            network: {
+              type: "object",
+              properties: {
+                methods: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by HTTP methods: GET, POST, PUT, DELETE, etc."
+                },
+                statusCodes: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Filter by specific status codes"
+                },
+                statusRange: {
+                  type: "object",
+                  properties: {
+                    min: { type: "number" },
+                    max: { type: "number" }
+                  },
+                  description: "Filter by status code range (e.g., {min: 400, max: 599} for errors)"
+                },
+                urlPattern: {
+                  type: "string",
+                  description: "Filter by URL pattern (regex)"
+                },
+                resourceTypes: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Filter by resource types: xhr, fetch, document, script, stylesheet, image"
+                },
+                failedOnly: {
+                  type: "boolean",
+                  description: "Show only failed requests"
+                }
+              }
+            }
+          },
+          description: "Filters to apply to logs"
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of entries to return per log type (default: 100)"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserNewTab,
+    description: "Open a new browser tab and optionally navigate to a URL. Returns the tab ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Optional URL to navigate to in the new tab"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserListTabs,
+    description: "List all open browser tabs with their IDs, URLs, and titles",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserSwitchTab,
+    description: "Switch to a different browser tab by its ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: {
+          type: "string",
+          description: "The ID of the tab to switch to"
+        }
+      },
+      required: ["tabId"]
+    }
+  },
+  {
+    name: ToolName.BrowserCloseTab,
+    description: "Close a browser tab by its ID. If closing the active tab, switches to another open tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: {
+          type: "string",
+          description: "The ID of the tab to close (defaults to active tab if not specified)"
+        }
+      },
+      required: []
+    }
+  },
 ];
+
+// Tab tracking interface
+interface TabInfo {
+  page: Page;
+  id: string;
+}
 
 // Global state
 let browser: Browser | undefined;
-let page: Page | undefined;
-const consoleLogs: string[] = [];
+let context: BrowserContext | undefined;
+const tabs = new Map<string, TabInfo>();
+let activeTabId: string | undefined;
+let tabCounter = 0;
+const consoleLogs: ConsoleLogEntry[] = [];
+const networkLogs: NetworkLogEntry[] = [];
+const pendingRequests = new Map<string, { startTime: number; id: string }>();
 const screenshots = new Map<string, string>();
 
-async function ensureBrowser() {
-  if (!browser) {
-    browser = await playwright.firefox.launch({ headless: false });
-  }
+// Helper to get active page
+function getActivePage(): Page | undefined {
+  if (!activeTabId) return undefined;
+  const tab = tabs.get(activeTabId);
+  return tab?.page;
+}
 
-  if (!page) {
-    page = await browser.newPage();
-  }
+// Helper to generate tab ID
+function generateTabId(): string {
+  return `tab-${++tabCounter}`;
+}
 
-  page.on("console", (msg) => {
-    const logEntry = `[${msg.type()}] ${msg.text()}`;
-    consoleLogs.push(logEntry);
+// Helper function to attach page event listeners for logging
+function attachPageListeners(targetPage: Page) {
+  // Console listener
+  targetPage.on("console", (msg) => {
+    if (consoleLogs.length >= MAX_CONSOLE_LOGS) {
+      consoleLogs.shift();
+    }
+    const entry: ConsoleLogEntry = {
+      timestamp: Date.now(),
+      type: msg.type(),
+      text: msg.text()
+    };
+    consoleLogs.push(entry);
     server.notification({
       method: "notifications/resources/updated",
       params: { uri: "console://logs" },
     });
   });
-  return page!;
+
+  // Request listener - capture outgoing requests
+  targetPage.on("request", (request) => {
+    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const key = request.url() + request.method();
+    pendingRequests.set(key, { startTime: Date.now(), id });
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id,
+      timestamp: Date.now(),
+      type: 'request',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType()
+    };
+    networkLogs.push(entry);
+  });
+
+  // Response listener - capture responses
+  targetPage.on("response", (response) => {
+    const request = response.request();
+    const key = request.url() + request.method();
+    const pending = pendingRequests.get(key);
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id: pending?.id || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: Date.now(),
+      type: 'response',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      status: response.status(),
+      statusText: response.statusText(),
+      duration: pending ? Date.now() - pending.startTime : undefined
+    };
+    networkLogs.push(entry);
+    pendingRequests.delete(key);
+  });
+
+  // Request failed listener
+  targetPage.on("requestfailed", (request) => {
+    const key = request.url() + request.method();
+    const pending = pendingRequests.get(key);
+    const failure = request.failure();
+
+    if (networkLogs.length >= MAX_NETWORK_LOGS) {
+      networkLogs.shift();
+    }
+    const entry: NetworkLogEntry = {
+      id: pending?.id || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: Date.now(),
+      type: 'requestfailed',
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      errorText: failure?.errorText || 'Unknown error',
+      duration: pending ? Date.now() - pending.startTime : undefined
+    };
+    networkLogs.push(entry);
+    pendingRequests.delete(key);
+  });
+}
+
+async function closeBrowser() {
+  // Close all tabs
+  for (const [tabId, tabInfo] of tabs) {
+    try { await tabInfo.page.close(); } catch {}
+  }
+  tabs.clear();
+  activeTabId = undefined;
+  tabCounter = 0;
+
+  if (context) {
+    try { await context.close(); } catch {}
+    context = undefined;
+  }
+  if (browser) {
+    try { await browser.close(); } catch {}
+    browser = undefined;
+  }
+
+  // Clear logs on browser close
+  consoleLogs.length = 0;
+  networkLogs.length = 0;
+  pendingRequests.clear();
+}
+
+async function ensureBrowser(): Promise<Page> {
+  if (!browser) {
+    browser = await playwright.chromium.launch({ headless: false });
+    context = await browser.newContext();
+  }
+
+  // If no tabs exist, create one
+  if (tabs.size === 0) {
+    const page = await context!.newPage();
+    const tabId = generateTabId();
+    tabs.set(tabId, { page, id: tabId });
+    activeTabId = tabId;
+    attachPageListeners(page);
+  }
+
+  return getActivePage()!;
 }
 
 async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult> {
+  // Handle browser lifecycle tools first (don't need ensureBrowser)
+  switch (name) {
+    case ToolName.BrowserLaunch: {
+      await closeBrowser();
+
+      const browserType = args.browserType || "chromium";
+      const headless = args.headless ?? false;
+      const cdpEndpoint = args.cdpEndpoint;
+      const debugPort = args.debugPort;
+
+      // Validate CDP only works with chromium
+      if (cdpEndpoint && browserType !== "chromium") {
+        return {
+          content: [{ type: "text", text: "CDP connection only works with chromium" }],
+          isError: true
+        };
+      }
+
+      // Validate debugPort cannot be used with cdpEndpoint
+      if (debugPort && cdpEndpoint) {
+        return {
+          content: [{ type: "text", text: "debugPort cannot be used with cdpEndpoint (connecting to existing browser)" }],
+          isError: true
+        };
+      }
+
+      // Validate debugPort only works with chromium
+      if (debugPort && browserType !== "chromium") {
+        return {
+          content: [{ type: "text", text: "debugPort only works with chromium browser type" }],
+          isError: true
+        };
+      }
+
+      try {
+        // Handle cdpEndpoint path - connect to existing browser
+        if (cdpEndpoint) {
+          browser = await chromium.connectOverCDP(cdpEndpoint);
+          const contexts = browser.contexts();
+          context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+        } else {
+          // Handle normal Playwright launch
+          const launchOptions: any = { headless };
+          const launchArgs: string[] = [];
+
+          if (args.windowPosition && !headless) {
+            launchArgs.push(`--window-position=${args.windowPosition.x},${args.windowPosition.y}`);
+          }
+
+          // Add remote debugging port if specified
+          if (debugPort) {
+            launchArgs.push(`--remote-debugging-port=${debugPort}`);
+          }
+
+          if (launchArgs.length > 0) {
+            launchOptions.args = launchArgs;
+          }
+
+          browser = await playwright[browserType as "chromium" | "firefox" | "webkit"].launch(launchOptions);
+
+          const contextOptions: any = {};
+          if (args.viewport) {
+            contextOptions.viewport = args.viewport;
+          }
+          context = await browser.newContext(contextOptions);
+        }
+
+        // Create first tab
+        const newPage = await context.newPage();
+        const tabId = generateTabId();
+        tabs.set(tabId, { page: newPage, id: tabId });
+        activeTabId = tabId;
+        attachPageListeners(newPage);
+
+        let responseText = cdpEndpoint
+          ? `Connected to browser via CDP at ${cdpEndpoint}`
+          : `Launched ${browserType} (headless: ${headless})`;
+
+        if (debugPort) {
+          responseText += ` with remote debugging on port ${debugPort}`;
+        }
+        responseText += `. Active tab: ${tabId}`;
+
+        return {
+          content: [{ type: "text", text: responseText }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to launch browser: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserClose: {
+      if (!browser) {
+        return {
+          content: [{ type: "text", text: "No browser is currently open" }],
+          isError: false
+        };
+      }
+      await closeBrowser();
+      return {
+        content: [{ type: "text", text: "Browser closed" }],
+        isError: false
+      };
+    }
+  }
+
+  // For all other tools, ensure browser exists
   const page = await ensureBrowser();
 
   switch (name) {
@@ -192,11 +650,21 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
       };
 
     case ToolName.BrowserScreenshot: {
-      const fullPage = (args.fullPage === 'true');
+      const fullPage = (args.fullPage === 'true' || args.fullPage === true);
+      const grayscale = args.grayscale !== false; // Default true
 
-      const screenshot = await (args.selector ?
+      let screenshot = await (args.selector ?
         page.locator(args.selector).screenshot() :
         page.screenshot({ fullPage }));
+
+      // Convert to grayscale if enabled (reduces size by ~76%)
+      if (grayscale) {
+        screenshot = await sharp(screenshot)
+          .grayscale()
+          .png()
+          .toBuffer();
+      }
+
       const base64Screenshot = screenshot.toString('base64');
 
       if (!base64Screenshot) {
@@ -560,6 +1028,246 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         };
       }
 
+    case ToolName.BrowserGetLogs: {
+      const logTypes: string[] = args.logTypes || ["console", "network"];
+      const clear = args.clear ?? false;
+      const filter = args.filter || {};
+      const limit = args.limit ?? 100;
+
+      const result: any = {};
+
+      // Process console logs
+      if (logTypes.includes("console")) {
+        let filtered = [...consoleLogs];
+
+        if (filter.console) {
+          if (filter.console.types && filter.console.types.length > 0) {
+            filtered = filtered.filter(log => filter.console.types.includes(log.type));
+          }
+          if (filter.console.search) {
+            const searchLower = filter.console.search.toLowerCase();
+            filtered = filtered.filter(log => log.text.toLowerCase().includes(searchLower));
+          }
+        }
+
+        // Apply limit (most recent first)
+        result.console = {
+          total: consoleLogs.length,
+          filtered: filtered.length,
+          entries: filtered.slice(-limit).reverse()
+        };
+      }
+
+      // Process network logs
+      if (logTypes.includes("network")) {
+        let filtered = [...networkLogs];
+
+        if (filter.network) {
+          if (filter.network.methods && filter.network.methods.length > 0) {
+            const methods = filter.network.methods.map((m: string) => m.toUpperCase());
+            filtered = filtered.filter(log => methods.includes(log.method));
+          }
+          if (filter.network.statusCodes && filter.network.statusCodes.length > 0) {
+            filtered = filtered.filter(log =>
+              log.status !== undefined && filter.network.statusCodes.includes(log.status)
+            );
+          }
+          if (filter.network.statusRange) {
+            const { min, max } = filter.network.statusRange;
+            filtered = filtered.filter(log =>
+              log.status !== undefined && log.status >= min && log.status <= max
+            );
+          }
+          if (filter.network.urlPattern) {
+            const regex = new RegExp(filter.network.urlPattern, 'i');
+            filtered = filtered.filter(log => regex.test(log.url));
+          }
+          if (filter.network.resourceTypes && filter.network.resourceTypes.length > 0) {
+            filtered = filtered.filter(log =>
+              filter.network.resourceTypes.includes(log.resourceType)
+            );
+          }
+          if (filter.network.failedOnly) {
+            filtered = filtered.filter(log => log.type === 'requestfailed');
+          }
+        }
+
+        // Apply limit (most recent first)
+        result.network = {
+          total: networkLogs.length,
+          filtered: filtered.length,
+          entries: filtered.slice(-limit).reverse()
+        };
+      }
+
+      // Clear logs if requested
+      if (clear) {
+        if (logTypes.includes("console")) {
+          consoleLogs.length = 0;
+        }
+        if (logTypes.includes("network")) {
+          networkLogs.length = 0;
+          pendingRequests.clear();
+        }
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(result, null, 2)
+        }],
+        isError: false
+      };
+    }
+
+    case ToolName.BrowserNewTab: {
+      if (!context) {
+        return {
+          content: [{ type: "text", text: "No browser is open. Use browser_launch first." }],
+          isError: true
+        };
+      }
+
+      try {
+        const newPage = await context.newPage();
+        const tabId = generateTabId();
+        tabs.set(tabId, { page: newPage, id: tabId });
+        activeTabId = tabId;
+        attachPageListeners(newPage);
+
+        // Navigate to URL if provided
+        if (args.url) {
+          await newPage.goto(args.url);
+          return {
+            content: [{ type: "text", text: `Opened new tab ${tabId} and navigated to ${args.url}` }],
+            isError: false
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: `Opened new tab ${tabId} (now active)` }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to open new tab: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserListTabs: {
+      if (tabs.size === 0) {
+        return {
+          content: [{ type: "text", text: "No tabs are open" }],
+          isError: false
+        };
+      }
+
+      try {
+        const tabList = await Promise.all(
+          Array.from(tabs.values()).map(async (tab) => {
+            const url = tab.page.url();
+            const title = await tab.page.title();
+            const isActive = tab.id === activeTabId;
+            return {
+              id: tab.id,
+              url,
+              title,
+              active: isActive
+            };
+          })
+        );
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(tabList, null, 2) }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to list tabs: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserSwitchTab: {
+      const tabId = args.tabId;
+
+      if (!tabs.has(tabId)) {
+        const availableTabs = Array.from(tabs.keys()).join(", ");
+        return {
+          content: [{ type: "text", text: `Tab ${tabId} not found. Available tabs: ${availableTabs || "none"}` }],
+          isError: true
+        };
+      }
+
+      activeTabId = tabId;
+      const tab = tabs.get(tabId)!;
+
+      // Bring the tab to front
+      try {
+        await tab.page.bringToFront();
+      } catch {}
+
+      const url = tab.page.url();
+      const title = await tab.page.title();
+
+      return {
+        content: [{ type: "text", text: `Switched to tab ${tabId} (${title || url})` }],
+        isError: false
+      };
+    }
+
+    case ToolName.BrowserCloseTab: {
+      const tabId = args.tabId || activeTabId;
+
+      if (!tabId) {
+        return {
+          content: [{ type: "text", text: "No tab specified and no active tab" }],
+          isError: true
+        };
+      }
+
+      if (!tabs.has(tabId)) {
+        return {
+          content: [{ type: "text", text: `Tab ${tabId} not found` }],
+          isError: true
+        };
+      }
+
+      const tab = tabs.get(tabId)!;
+
+      try {
+        await tab.page.close();
+      } catch {}
+
+      tabs.delete(tabId);
+
+      // If we closed the active tab, switch to another one
+      if (activeTabId === tabId) {
+        const remainingTabs = Array.from(tabs.keys());
+        if (remainingTabs.length > 0) {
+          activeTabId = remainingTabs[0];
+          return {
+            content: [{ type: "text", text: `Closed tab ${tabId}. Switched to ${activeTabId}` }],
+            isError: false
+          };
+        } else {
+          activeTabId = undefined;
+          return {
+            content: [{ type: "text", text: `Closed tab ${tabId}. No tabs remaining.` }],
+            isError: false
+          };
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: `Closed tab ${tabId}` }],
+        isError: false
+      };
+    }
+
     default:
       return {
         content: [{
@@ -605,11 +1313,16 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri.toString();
 
   if (uri === "console://logs") {
+    // Format console logs for resource read
+    const formattedLogs = consoleLogs.map(log =>
+      `[${log.type}] ${log.text}`
+    ).join("\n");
+
     return {
       contents: [{
         uri,
         mimeType: "text/plain",
-        text: consoleLogs.join("\n"),
+        text: formattedLogs,
       }],
     };
   }
