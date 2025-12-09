@@ -18,6 +18,7 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import playwright, { Browser, Page, BrowserContext, chromium, firefox, webkit } from "playwright";
+import sharp from 'sharp';
 
 // Log entry interfaces
 interface NetworkLogEntry {
@@ -56,7 +57,11 @@ enum ToolName {
   BrowserHover = "browser_hover",
   BrowserHoverText = "browser_hover_text",
   BrowserEvaluate = "browser_evaluate",
-  BrowserGetLogs = "browser_get_logs"
+  BrowserGetLogs = "browser_get_logs",
+  BrowserNewTab = "browser_new_tab",
+  BrowserListTabs = "browser_list_tabs",
+  BrowserSwitchTab = "browser_switch_tab",
+  BrowserCloseTab = "browser_close_tab"
 }
 
 // Define the tools once to avoid repetition
@@ -133,6 +138,7 @@ const TOOLS: Tool[] = [
         name: { type: "string", description: "Name for the screenshot" },
         selector: { type: "string", description: "CSS selector for element to screenshot" },
         fullPage: { type: "boolean", description: "Take a full page screenshot (default: false)", default: false },
+        grayscale: { type: "boolean", description: "Convert to grayscale to reduce size by ~76% (default: true)", default: true },
       },
       required: ["name"],
     },
@@ -307,16 +313,87 @@ const TOOLS: Tool[] = [
       required: []
     }
   },
+  {
+    name: ToolName.BrowserNewTab,
+    description: "Open a new browser tab and optionally navigate to a URL. Returns the tab ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Optional URL to navigate to in the new tab"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserListTabs,
+    description: "List all open browser tabs with their IDs, URLs, and titles",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: ToolName.BrowserSwitchTab,
+    description: "Switch to a different browser tab by its ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: {
+          type: "string",
+          description: "The ID of the tab to switch to"
+        }
+      },
+      required: ["tabId"]
+    }
+  },
+  {
+    name: ToolName.BrowserCloseTab,
+    description: "Close a browser tab by its ID. If closing the active tab, switches to another open tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: {
+          type: "string",
+          description: "The ID of the tab to close (defaults to active tab if not specified)"
+        }
+      },
+      required: []
+    }
+  },
 ];
+
+// Tab tracking interface
+interface TabInfo {
+  page: Page;
+  id: string;
+}
 
 // Global state
 let browser: Browser | undefined;
 let context: BrowserContext | undefined;
-let page: Page | undefined;
+const tabs = new Map<string, TabInfo>();
+let activeTabId: string | undefined;
+let tabCounter = 0;
 const consoleLogs: ConsoleLogEntry[] = [];
 const networkLogs: NetworkLogEntry[] = [];
 const pendingRequests = new Map<string, { startTime: number; id: string }>();
 const screenshots = new Map<string, string>();
+
+// Helper to get active page
+function getActivePage(): Page | undefined {
+  if (!activeTabId) return undefined;
+  const tab = tabs.get(activeTabId);
+  return tab?.page;
+}
+
+// Helper to generate tab ID
+function generateTabId(): string {
+  return `tab-${++tabCounter}`;
+}
 
 // Helper function to attach page event listeners for logging
 function attachPageListeners(targetPage: Page) {
@@ -406,10 +483,14 @@ function attachPageListeners(targetPage: Page) {
 }
 
 async function closeBrowser() {
-  if (page) {
-    try { await page.close(); } catch {}
-    page = undefined;
+  // Close all tabs
+  for (const [tabId, tabInfo] of tabs) {
+    try { await tabInfo.page.close(); } catch {}
   }
+  tabs.clear();
+  activeTabId = undefined;
+  tabCounter = 0;
+
   if (context) {
     try { await context.close(); } catch {}
     context = undefined;
@@ -418,24 +499,29 @@ async function closeBrowser() {
     try { await browser.close(); } catch {}
     browser = undefined;
   }
+
   // Clear logs on browser close
   consoleLogs.length = 0;
   networkLogs.length = 0;
   pendingRequests.clear();
 }
 
-async function ensureBrowser() {
+async function ensureBrowser(): Promise<Page> {
   if (!browser) {
     browser = await playwright.chromium.launch({ headless: false });
     context = await browser.newContext();
   }
 
-  if (!page) {
-    page = await context!.newPage();
+  // If no tabs exist, create one
+  if (tabs.size === 0) {
+    const page = await context!.newPage();
+    const tabId = generateTabId();
+    tabs.set(tabId, { page, id: tabId });
+    activeTabId = tabId;
     attachPageListeners(page);
   }
 
-  return page!;
+  return getActivePage()!;
 }
 
 async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult> {
@@ -474,11 +560,13 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
       }
 
       try {
+        // Handle cdpEndpoint path - connect to existing browser
         if (cdpEndpoint) {
           browser = await chromium.connectOverCDP(cdpEndpoint);
           const contexts = browser.contexts();
           context = contexts.length > 0 ? contexts[0] : await browser.newContext();
         } else {
+          // Handle normal Playwright launch
           const launchOptions: any = { headless };
           const launchArgs: string[] = [];
 
@@ -504,8 +592,12 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
           context = await browser.newContext(contextOptions);
         }
 
-        page = await context.newPage();
-        attachPageListeners(page);
+        // Create first tab
+        const newPage = await context.newPage();
+        const tabId = generateTabId();
+        tabs.set(tabId, { page: newPage, id: tabId });
+        activeTabId = tabId;
+        attachPageListeners(newPage);
 
         let responseText = cdpEndpoint
           ? `Connected to browser via CDP at ${cdpEndpoint}`
@@ -514,6 +606,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if (debugPort) {
           responseText += ` with remote debugging on port ${debugPort}`;
         }
+        responseText += `. Active tab: ${tabId}`;
 
         return {
           content: [{ type: "text", text: responseText }],
@@ -543,11 +636,11 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
   }
 
   // For all other tools, ensure browser exists
-  await ensureBrowser();
+  const page = await ensureBrowser();
 
   switch (name) {
     case ToolName.BrowserNavigate:
-      await page!.goto(args.url);
+      await page.goto(args.url);
       return {
         content: [{
           type: "text",
@@ -557,11 +650,21 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
       };
 
     case ToolName.BrowserScreenshot: {
-      const fullPage = (args.fullPage === 'true');
+      const fullPage = (args.fullPage === 'true' || args.fullPage === true);
+      const grayscale = args.grayscale !== false; // Default true
 
-      const screenshot = await (args.selector ?
-        page!.locator(args.selector).screenshot() :
-        page!.screenshot({ fullPage }));
+      let screenshot = await (args.selector ?
+        page.locator(args.selector).screenshot() :
+        page.screenshot({ fullPage }));
+
+      // Convert to grayscale if enabled (reduces size by ~76%)
+      if (grayscale) {
+        screenshot = await sharp(screenshot)
+          .grayscale()
+          .png()
+          .toBuffer();
+      }
+
       const base64Screenshot = screenshot.toString('base64');
 
       if (!base64Screenshot) {
@@ -597,7 +700,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserClick:
       try {
-        await page!.locator(args.selector).click();
+        await page.locator(args.selector).click();
         return {
           content: [{
             type: "text",
@@ -609,7 +712,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.locator(args.selector).first().click();
+                await page.locator(args.selector).first().click();
                 return {
                     content: [{
                         type: "text",
@@ -639,7 +742,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserClickText:
       try {
-        await page!.getByText(args.text).click();
+        await page.getByText(args.text).click();
         return {
           content: [{
             type: "text",
@@ -651,7 +754,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.getByText(args.text).first().click();
+                await page.getByText(args.text).first().click();
                 return {
                     content: [{
                         type: "text",
@@ -680,7 +783,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserFill:
       try {
-        await page!.locator(args.selector).pressSequentially(args.value, { delay: 100 });
+        await page.locator(args.selector).pressSequentially(args.value, { delay: 100 });
         return {
           content: [{
             type: "text",
@@ -692,7 +795,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.locator(args.selector).first().pressSequentially(args.value, { delay: 100 });
+                await page.locator(args.selector).first().pressSequentially(args.value, { delay: 100 });
                 return {
                     content: [{
                         type: "text",
@@ -721,7 +824,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserSelect:
       try {
-        await page!.locator(args.selector).selectOption(args.value);
+        await page.locator(args.selector).selectOption(args.value);
         return {
           content: [{
             type: "text",
@@ -733,7 +836,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.locator(args.selector).first().selectOption(args.value);
+                await page.locator(args.selector).first().selectOption(args.value);
                 return {
                     content: [{
                         type: "text",
@@ -762,7 +865,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserSelectText:
       try {
-        await page!.getByText(args.text).selectOption(args.value);
+        await page.getByText(args.text).selectOption(args.value);
         return {
           content: [{
             type: "text",
@@ -774,7 +877,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.getByText(args.text).first().selectOption(args.value);
+                await page.getByText(args.text).first().selectOption(args.value);
                 return {
                     content: [{
                         type: "text",
@@ -803,7 +906,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserHover:
       try {
-        await page!.locator(args.selector).hover();
+        await page.locator(args.selector).hover();
         return {
           content: [{
             type: "text",
@@ -815,7 +918,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.locator(args.selector).first().hover();
+                await page.locator(args.selector).first().hover();
                 return {
                     content: [{
                         type: "text",
@@ -844,7 +947,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserHoverText:
       try {
-        await page!.getByText(args.text).hover();
+        await page.getByText(args.text).hover();
         return {
           content: [{
             type: "text",
@@ -856,7 +959,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         if((error as Error).message.includes("strict mode violation")) {
             console.log("Strict mode violation, retrying on first element...");
             try {
-                await page!.getByText(args.text).first().hover();
+                await page.getByText(args.text).first().hover();
                 return {
                     content: [{
                         type: "text",
@@ -885,7 +988,7 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
 
     case ToolName.BrowserEvaluate:
       try {
-        const result = await page!.evaluate((script) => {
+        const result = await page.evaluate((script) => {
           const logs: string[] = [];
           const originalConsole = { ...console };
 
@@ -1013,6 +1116,154 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
           type: "text",
           text: JSON.stringify(result, null, 2)
         }],
+        isError: false
+      };
+    }
+
+    case ToolName.BrowserNewTab: {
+      if (!context) {
+        return {
+          content: [{ type: "text", text: "No browser is open. Use browser_launch first." }],
+          isError: true
+        };
+      }
+
+      try {
+        const newPage = await context.newPage();
+        const tabId = generateTabId();
+        tabs.set(tabId, { page: newPage, id: tabId });
+        activeTabId = tabId;
+        attachPageListeners(newPage);
+
+        // Navigate to URL if provided
+        if (args.url) {
+          await newPage.goto(args.url);
+          return {
+            content: [{ type: "text", text: `Opened new tab ${tabId} and navigated to ${args.url}` }],
+            isError: false
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: `Opened new tab ${tabId} (now active)` }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to open new tab: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserListTabs: {
+      if (tabs.size === 0) {
+        return {
+          content: [{ type: "text", text: "No tabs are open" }],
+          isError: false
+        };
+      }
+
+      try {
+        const tabList = await Promise.all(
+          Array.from(tabs.values()).map(async (tab) => {
+            const url = tab.page.url();
+            const title = await tab.page.title();
+            const isActive = tab.id === activeTabId;
+            return {
+              id: tab.id,
+              url,
+              title,
+              active: isActive
+            };
+          })
+        );
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(tabList, null, 2) }],
+          isError: false
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to list tabs: ${(error as Error).message}` }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserSwitchTab: {
+      const tabId = args.tabId;
+
+      if (!tabs.has(tabId)) {
+        const availableTabs = Array.from(tabs.keys()).join(", ");
+        return {
+          content: [{ type: "text", text: `Tab ${tabId} not found. Available tabs: ${availableTabs || "none"}` }],
+          isError: true
+        };
+      }
+
+      activeTabId = tabId;
+      const tab = tabs.get(tabId)!;
+
+      // Bring the tab to front
+      try {
+        await tab.page.bringToFront();
+      } catch {}
+
+      const url = tab.page.url();
+      const title = await tab.page.title();
+
+      return {
+        content: [{ type: "text", text: `Switched to tab ${tabId} (${title || url})` }],
+        isError: false
+      };
+    }
+
+    case ToolName.BrowserCloseTab: {
+      const tabId = args.tabId || activeTabId;
+
+      if (!tabId) {
+        return {
+          content: [{ type: "text", text: "No tab specified and no active tab" }],
+          isError: true
+        };
+      }
+
+      if (!tabs.has(tabId)) {
+        return {
+          content: [{ type: "text", text: `Tab ${tabId} not found` }],
+          isError: true
+        };
+      }
+
+      const tab = tabs.get(tabId)!;
+
+      try {
+        await tab.page.close();
+      } catch {}
+
+      tabs.delete(tabId);
+
+      // If we closed the active tab, switch to another one
+      if (activeTabId === tabId) {
+        const remainingTabs = Array.from(tabs.keys());
+        if (remainingTabs.length > 0) {
+          activeTabId = remainingTabs[0];
+          return {
+            content: [{ type: "text", text: `Closed tab ${tabId}. Switched to ${activeTabId}` }],
+            isError: false
+          };
+        } else {
+          activeTabId = undefined;
+          return {
+            content: [{ type: "text", text: `Closed tab ${tabId}. No tabs remaining.` }],
+            isError: false
+          };
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: `Closed tab ${tabId}` }],
         isError: false
       };
     }
