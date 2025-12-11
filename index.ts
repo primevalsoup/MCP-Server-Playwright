@@ -61,7 +61,11 @@ enum ToolName {
   BrowserNewTab = "browser_new_tab",
   BrowserListTabs = "browser_list_tabs",
   BrowserSwitchTab = "browser_switch_tab",
-  BrowserCloseTab = "browser_close_tab"
+  BrowserCloseTab = "browser_close_tab",
+  BrowserWaitForSelector = "browser_wait_for_selector",
+  BrowserWaitForLoadState = "browser_wait_for_load_state",
+  BrowserWaitForUrl = "browser_wait_for_url",
+  BrowserWaitForFunction = "browser_wait_for_function"
 }
 
 // Define the tools once to avoid repetition
@@ -364,6 +368,88 @@ const TOOLS: Tool[] = [
       required: []
     }
   },
+  {
+    name: ToolName.BrowserWaitForSelector,
+    description: "Wait for an element matching the selector to appear in the DOM",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: {
+          type: "string",
+          description: "CSS selector for the element to wait for"
+        },
+        state: {
+          type: "string",
+          enum: ["attached", "detached", "visible", "hidden"],
+          description: "Wait for element to reach this state (default: visible)"
+        },
+        timeout: {
+          type: "number",
+          description: "Maximum time to wait in milliseconds (default: 30000)"
+        }
+      },
+      required: ["selector"]
+    }
+  },
+  {
+    name: ToolName.BrowserWaitForLoadState,
+    description: "Wait for the page to reach a specific load state",
+    inputSchema: {
+      type: "object",
+      properties: {
+        state: {
+          type: "string",
+          enum: ["load", "domcontentloaded", "networkidle"],
+          description: "Load state to wait for"
+        },
+        timeout: {
+          type: "number",
+          description: "Maximum time to wait in milliseconds (default: 30000)"
+        }
+      },
+      required: ["state"]
+    }
+  },
+  {
+    name: ToolName.BrowserWaitForUrl,
+    description: "Wait for the page URL to match a pattern (supports glob patterns like **/path/**)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "URL string or glob pattern to match (e.g., '**/login**', 'https://example.com/dashboard')"
+        },
+        timeout: {
+          type: "number",
+          description: "Maximum time to wait in milliseconds (default: 30000)"
+        }
+      },
+      required: ["url"]
+    }
+  },
+  {
+    name: ToolName.BrowserWaitForFunction,
+    description: "Wait for a JavaScript function to return a truthy value",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expression: {
+          type: "string",
+          description: "JavaScript expression to evaluate (should return truthy when condition is met)"
+        },
+        timeout: {
+          type: "number",
+          description: "Maximum time to wait in milliseconds (default: 30000)"
+        },
+        polling: {
+          type: ["number", "string"],
+          description: "Polling interval in ms, or 'raf' for requestAnimationFrame (default: 'raf')"
+        }
+      },
+      required: ["expression"]
+    }
+  },
 ];
 
 // Tab tracking interface
@@ -592,12 +678,21 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
           context = await browser.newContext(contextOptions);
         }
 
-        // Create first tab
-        const newPage = await context.newPage();
+        // Create first tab (or reuse existing for CDP reconnect)
+        let activePage: Page;
+        const existingPages = context.pages();
+
+        if (cdpEndpoint && existingPages.length > 0) {
+          // Reuse first existing page when connecting via CDP
+          activePage = existingPages[0];
+        } else {
+          activePage = await context.newPage();
+        }
+
         const tabId = generateTabId();
-        tabs.set(tabId, { page: newPage, id: tabId });
+        tabs.set(tabId, { page: activePage, id: tabId });
         activeTabId = tabId;
-        attachPageListeners(newPage);
+        attachPageListeners(activePage);
 
         let responseText = cdpEndpoint
           ? `Connected to browser via CDP at ${cdpEndpoint}`
@@ -1266,6 +1361,119 @@ async function handleToolCall(name: ToolName, args: any): Promise<CallToolResult
         content: [{ type: "text", text: `Closed tab ${tabId}` }],
         isError: false
       };
+    }
+
+    case ToolName.BrowserWaitForSelector: {
+      const selector = args.selector;
+      const state = args.state || "visible";
+      const timeout = args.timeout ?? 30000;
+      const startTime = Date.now();
+
+      try {
+        await page.waitForSelector(selector, { state, timeout });
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [{
+            type: "text",
+            text: `Selector "${selector}" reached state "${state}" after ${elapsed}ms`
+          }],
+          isError: false
+        };
+      } catch (error) {
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [{
+            type: "text",
+            text: `Timeout: Waited ${elapsed}ms for selector "${selector}" to reach state "${state}". ${(error as Error).message}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserWaitForLoadState: {
+      const state = args.state as "load" | "domcontentloaded" | "networkidle";
+      const timeout = args.timeout ?? 30000;
+      const startTime = Date.now();
+
+      try {
+        await page.waitForLoadState(state, { timeout });
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [{
+            type: "text",
+            text: `Page reached load state "${state}" after ${elapsed}ms`
+          }],
+          isError: false
+        };
+      } catch (error) {
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [{
+            type: "text",
+            text: `Timeout: Waited ${elapsed}ms for load state "${state}". ${(error as Error).message}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserWaitForUrl: {
+      const url = args.url;
+      const timeout = args.timeout ?? 30000;
+      const startTime = Date.now();
+
+      try {
+        await page.waitForURL(url, { timeout });
+        const elapsed = Date.now() - startTime;
+        const currentUrl = page.url();
+        return {
+          content: [{
+            type: "text",
+            text: `URL matched pattern "${url}" after ${elapsed}ms. Current URL: ${currentUrl}`
+          }],
+          isError: false
+        };
+      } catch (error) {
+        const elapsed = Date.now() - startTime;
+        const currentUrl = page.url();
+        return {
+          content: [{
+            type: "text",
+            text: `Timeout: Waited ${elapsed}ms for URL to match "${url}". Current URL: ${currentUrl}. ${(error as Error).message}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case ToolName.BrowserWaitForFunction: {
+      const expression = args.expression;
+      const timeout = args.timeout ?? 30000;
+      const polling = args.polling ?? "raf";
+      const startTime = Date.now();
+
+      try {
+        const result = await page.waitForFunction(expression, { timeout, polling });
+        const elapsed = Date.now() - startTime;
+        const value = await result.jsonValue();
+        return {
+          content: [{
+            type: "text",
+            text: `Function returned truthy after ${elapsed}ms. Result: ${JSON.stringify(value)}`
+          }],
+          isError: false
+        };
+      } catch (error) {
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [{
+            type: "text",
+            text: `Timeout: Waited ${elapsed}ms for function to return truthy. Expression: "${expression}". ${(error as Error).message}`
+          }],
+          isError: true
+        };
+      }
     }
 
     default:
