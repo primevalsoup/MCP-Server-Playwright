@@ -443,7 +443,10 @@ const TOOLS: Tool[] = [
           description: "Maximum time to wait in milliseconds (default: 30000)"
         },
         polling: {
-          type: ["number", "string"],
+          oneOf: [
+            { type: "number", description: "Polling interval in milliseconds" },
+            { type: "string", enum: ["raf"], description: "Use requestAnimationFrame for polling" }
+          ],
           description: "Polling interval in ms, or 'raf' for requestAnimationFrame (default: 'raf')"
         }
       },
